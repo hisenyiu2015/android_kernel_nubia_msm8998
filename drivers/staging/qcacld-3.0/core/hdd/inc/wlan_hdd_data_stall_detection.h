@@ -1,8 +1,5 @@
 /*
- * Copyright (c) 2012 The Linux Foundation. All rights reserved.
- *
- * Previously licensed under the ISC license by Qualcomm Atheros, Inc.
- *
+ * Copyright (c) 2017 The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -19,25 +16,26 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-/*
- * This file was originally distributed by Qualcomm Atheros, Inc.
- * under proprietary terms before Copyright ownership was assigned
- * to the Linux Foundation.
+#ifndef __WLAN_HDD_DATA_STALL_DETECTION_H
+#define __WLAN_HDD_DATA_STALL_DETECTION_H
+
+/**
+ * DOC: wlan_hdd_data_stall_detection.h
+ *
+ * WLAN Host Device Driver data stall detection API specification
  */
 
-#ifndef BIN_SIGN_H_
-#define BIN_SIGN_H_
+/**
+ * hdd_register_data_stall_detect_cb() - register data stall callback
+ *
+ * Return: 0 for success or Error code for failure
+ */
+int hdd_register_data_stall_detect_cb(void);
 
-/* Signed binary MetaData */
-typedef struct {
-    unsigned int magic_num;
-    unsigned int total_len;
-    unsigned int rampatch_len;
-    unsigned int product_id;
-    unsigned int patch_ver;
-    unsigned short sign_format_ver;
-    unsigned short sign_algorithm;
-    unsigned char reserved[8];
-} SIGN_HEADER_T;
-
-#endif /*  BIN_SIGN_H_ */
+/**
+ * hdd_deregister_data_stall_detect_cb() - de-register data stall callback
+ *
+ * Return: 0 for success or Error code for failure
+ */
+int hdd_deregister_data_stall_detect_cb(void);
+#endif /* __WLAN_HDD_DATA_STALL_DETECTION_H */
