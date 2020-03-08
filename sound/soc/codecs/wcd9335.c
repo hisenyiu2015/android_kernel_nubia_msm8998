@@ -3158,6 +3158,7 @@ static int tasha_codec_enable_slimrx(struct snd_soc_dapm_widget *w,
 		tasha_codec_vote_max_bw(codec, true);
 		break;
 	case SND_SOC_DAPM_POST_PMD:
+		tasha_codec_vote_max_bw(codec,true);
 		ret = wcd9xxx_disconnect_port(core, &dai->wcd9xxx_ch_list,
 					      dai->grph);
 		dev_dbg(codec->dev, "%s: Disconnect RX port, ret = %d\n",
@@ -3171,6 +3172,7 @@ static int tasha_codec_enable_slimrx(struct snd_soc_dapm_widget *w,
 				__func__);
 		ret = wcd9xxx_close_slim_sch_rx(core, &dai->wcd9xxx_ch_list,
 						dai->grph);
+		tasha_codec_vote_max_bw(codec,false);
 		break;
 	}
 	return ret;
@@ -6067,6 +6069,10 @@ static int tasha_codec_enable_adc(struct snd_soc_dapm_widget *w,
 	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
 
 	dev_dbg(codec->dev, "%s: event:%d\n", __func__, event);
+
+	//lxl add start ,resolved pr00389960
+	msleep(2);
+	//lxl add end
 
 	switch (event) {
 	case SND_SOC_DAPM_PRE_PMU:

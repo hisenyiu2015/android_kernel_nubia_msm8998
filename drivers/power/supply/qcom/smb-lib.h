@@ -59,12 +59,14 @@ enum print_reason {
 #define SW_QC3_VOTER			"SW_QC3_VOTER"
 #define AICL_RERUN_VOTER		"AICL_RERUN_VOTER"
 #define LEGACY_UNKNOWN_VOTER		"LEGACY_UNKNOWN_VOTER"
+#define APSD_RERUN_VOTER		"APSD_RERUN_VOTER"
 #define CC2_WA_VOTER			"CC2_WA_VOTER"
 #define QNOVO_VOTER			"QNOVO_VOTER"
 #define BATT_PROFILE_VOTER		"BATT_PROFILE_VOTER"
 #define OTG_DELAY_VOTER			"OTG_DELAY_VOTER"
 #define USBIN_I_VOTER			"USBIN_I_VOTER"
 #define WEAK_CHARGER_VOTER		"WEAK_CHARGER_VOTER"
+#define DC_USBIN_VOTER			"DC_USBIN_VOTER"
 
 #define VCONN_MAX_ATTEMPTS	3
 #define OTG_MAX_ATTEMPTS	3
@@ -308,6 +310,27 @@ struct smb_charger {
 	int			thermal_levels;
 	int			*thermal_mitigation;
 	int			dcp_icl_ua;
+
+#if defined(CONFIG_TYPEC_AUDIO_ADAPTER_SWITCH)
+	int			usb_audio_select_supported;
+	int			switch_en;
+	int			switch_select;
+	int			mbhc_int;
+#endif
+
+#if defined(CONFIG_NUBIA_CHARGE_FEATURE)
+	bool 		bat_temp_limit_support;
+	int 		bat_temp_limit_mask;
+	int 		bat_temp_limit_current;
+	int 		bat_temp_jeita_current;
+	int			bat_temp_limit_threshold;
+	int 		bat_temp_limit_voltage;
+	struct delayed_work	 	typec_disable_cmd_work;
+	struct delayed_work	 	thermal_monitor_work;
+	struct delayed_work		jeita_fcv_monitor_work;
+	struct notifier_block 	fb_notifier;
+#endif
+
 	int			fake_capacity;
 	bool			step_chg_enabled;
 	bool			is_hdc;
@@ -389,6 +412,7 @@ irqreturn_t smblib_handle_batt_temp_changed(int irq, void *data);
 irqreturn_t smblib_handle_batt_psy_changed(int irq, void *data);
 irqreturn_t smblib_handle_usb_psy_changed(int irq, void *data);
 irqreturn_t smblib_handle_usbin_uv(int irq, void *data);
+irqreturn_t smblib_handle_usbin_ov(int irq, void *data);
 irqreturn_t smblib_handle_usb_plugin(int irq, void *data);
 irqreturn_t smblib_handle_usb_source_change(int irq, void *data);
 irqreturn_t smblib_handle_icl_change(int irq, void *data);
@@ -490,6 +514,8 @@ int smblib_set_prop_usb_voltage_max(struct smb_charger *chg,
 int smblib_set_prop_boost_current(struct smb_charger *chg,
 				const union power_supply_propval *val);
 int smblib_set_prop_typec_power_role(struct smb_charger *chg,
+				const union power_supply_propval *val);
+int smblib_set_prop_charging_enabled(struct smb_charger *chg,
 				const union power_supply_propval *val);
 int smblib_set_prop_pd_active(struct smb_charger *chg,
 				const union power_supply_propval *val);

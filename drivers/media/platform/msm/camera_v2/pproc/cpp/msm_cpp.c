@@ -3146,6 +3146,8 @@ long msm_cpp_subdev_ioctl(struct v4l2_subdev *sd,
 	struct msm_camera_v4l2_ioctl_t *ioctl_ptr = NULL;
 	int rc = 0;
 
+	CPP_DBG("E\n");
+
 	if (sd == NULL) {
 		pr_err("sd %pK\n", sd);
 		return -EINVAL;
@@ -3166,9 +3168,10 @@ long msm_cpp_subdev_ioctl(struct v4l2_subdev *sd,
 		pr_err("input validation failed\n");
 		return rc;
 	}
+
 	mutex_lock(&cpp_dev->mutex);
 
-	CPP_DBG("E cmd: 0x%x\n", cmd);
+	CPP_DBG("cmd: 0x%x\n", cmd);
 	switch (cmd) {
 	case VIDIOC_MSM_CPP_GET_HW_INFO: {
 		CPP_DBG("VIDIOC_MSM_CPP_GET_HW_INFO\n");
@@ -3639,9 +3642,6 @@ STREAM_BUFF_END:
 		}
 		break;
 	}
-	default:
-		pr_err_ratelimited("invalid value: cmd=0x%x\n", cmd);
-		break;
 	case VIDIOC_MSM_CPP_IOMMU_ATTACH: {
 		if (cpp_dev->iommu_state == CPP_IOMMU_STATE_DETACHED) {
 			int32_t stall_disable;
@@ -3674,12 +3674,13 @@ STREAM_BUFF_END:
 					CAM_SMMU_ATTACH);
 			}
 			if (rc < 0) {
-				pr_err("%s:%diommu_attach_device failed\n",
+				pr_err("%s:%d iommu attach failed\n",
 					__func__, __LINE__);
 				rc = -EINVAL;
 				break;
 			}
 			cpp_dev->iommu_state = CPP_IOMMU_STATE_ATTACHED;
+
 		} else {
 			pr_err("%s:%d IOMMMU attach triggered in invalid state\n",
 				__func__, __LINE__);
@@ -3708,29 +3709,37 @@ STREAM_BUFF_END:
 
 			cpp_dev->security_mode = cpp_attach_info.attach;
 
-			if (cpp_dev->security_mode == SECURE_MODE)
+			if (cpp_dev->security_mode == SECURE_MODE) {
 				rc = cam_smmu_ops(cpp_dev->iommu_hdl,
 					CAM_SMMU_DETACH_SEC_CPP);
-			else
+			} else {
 				rc = cam_smmu_ops(cpp_dev->iommu_hdl,
 					CAM_SMMU_DETACH);
+			}
 			if (rc < 0) {
-				pr_err("%s:%diommu detach failed\n", __func__,
+				pr_err("%s:%d iommu detach failed\n", __func__,
 					__LINE__);
 				rc = -EINVAL;
 				break;
 			}
 			cpp_dev->iommu_state = CPP_IOMMU_STATE_DETACHED;
+
 		} else {
-			pr_err("%s:%d IOMMMU attach triggered in invalid state\n",
+			pr_err("%s:%d IOMMMU detach triggered in invalid state\n",
 				__func__, __LINE__);
 			rc = -EINVAL;
 		}
 		break;
 	}
+	default:
+		pr_err_ratelimited("invalid value: cmd=0x%x\n", cmd);
+		break;
 	}
+
 	mutex_unlock(&cpp_dev->mutex);
+
 	CPP_DBG("X\n");
+
 	return rc;
 }
 
@@ -4377,6 +4386,7 @@ static long msm_cpp_subdev_fops_compat_ioctl(struct file *file,
 	}
 
 	mutex_unlock(&cpp_dev->mutex);
+
 	switch (cmd) {
 	case VIDIOC_MSM_CPP_LOAD_FIRMWARE:
 	case VIDIOC_MSM_CPP_FLUSH_QUEUE:
