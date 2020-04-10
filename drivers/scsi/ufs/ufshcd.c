@@ -701,6 +701,24 @@ static void ufshcd_print_tmrs(struct ufs_hba *hba, unsigned long bitmap)
 	}
 }
 
+static void ufshcd_print_fsm_state(struct ufs_hba *hba)
+{
+	int err = 0, tx_fsm_val = 0, rx_fsm_val = 0;
+
+	err = ufshcd_dme_get(hba,
+			UIC_ARG_MIB_SEL(MPHY_TX_FSM_STATE,
+			UIC_ARG_MPHY_TX_GEN_SEL_INDEX(0)),
+			&tx_fsm_val);
+	dev_err(hba->dev, "%s: TX_FSM_STATE = %u, err = %d\n", __func__,
+			tx_fsm_val, err);
+	err = ufshcd_dme_get(hba,
+			UIC_ARG_MIB_SEL(MPHY_RX_FSM_STATE,
+			UIC_ARG_MPHY_RX_GEN_SEL_INDEX(0)),
+			&rx_fsm_val);
+	dev_err(hba->dev, "%s: RX_FSM_STATE = %u, err = %d\n", __func__,
+			rx_fsm_val, err);
+}
+
 static void ufshcd_print_host_state(struct ufs_hba *hba)
 {
 	if (!(hba->ufshcd_dbg_print & UFSHCD_DBG_PRINT_HOST_STATE_EN))
@@ -1345,7 +1363,7 @@ start:
 		hba->clk_gating.state = REQ_CLKS_ON;
 		trace_ufshcd_clk_gating(dev_name(hba->dev),
 			hba->clk_gating.state);
-		queue_work(hba->clk_gating.ungating_workq,
+		queue_work(hba->clk_gating.clk_gating_workq,
 				&hba->clk_gating.ungate_work);
 		/*
 		 * fall through to check if we should wait for this
@@ -1613,7 +1631,8 @@ static enum hrtimer_restart ufshcd_clkgate_hrtimer_handler(
 	struct ufs_hba *hba = container_of(timer, struct ufs_hba,
 					   clk_gating.gate_hrtimer);
 
-	schedule_work(&hba->clk_gating.gate_work);
+	queue_work(hba->clk_gating.clk_gating_workq,
+				&hba->clk_gating.gate_work);
 
 	return HRTIMER_NORESTART;
 }
@@ -1621,7 +1640,7 @@ static enum hrtimer_restart ufshcd_clkgate_hrtimer_handler(
 static void ufshcd_init_clk_gating(struct ufs_hba *hba)
 {
 	struct ufs_clk_gating *gating = &hba->clk_gating;
-	char wq_name[sizeof("ufs_clk_ungating_00")];
+	char wq_name[sizeof("ufs_clk_gating_00")];
 
 	hba->clk_gating.state = CLKS_ON;
 
@@ -1650,9 +1669,10 @@ static void ufshcd_init_clk_gating(struct ufs_hba *hba)
 	hrtimer_init(&gating->gate_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	gating->gate_hrtimer.function = ufshcd_clkgate_hrtimer_handler;
 
-	snprintf(wq_name, ARRAY_SIZE(wq_name), "ufs_clk_ungating_%d",
+	snprintf(wq_name, ARRAY_SIZE(wq_name), "ufs_clk_gating_%d",
 			hba->host->host_no);
-	hba->clk_gating.ungating_workq = create_singlethread_workqueue(wq_name);
+	hba->clk_gating.clk_gating_workq =
+		create_singlethread_workqueue(wq_name);
 
 	gating->is_enabled = true;
 
@@ -1716,7 +1736,7 @@ static void ufshcd_exit_clk_gating(struct ufs_hba *hba)
 	device_remove_file(hba->dev, &hba->clk_gating.enable_attr);
 	ufshcd_cancel_gate_work(hba);
 	cancel_work_sync(&hba->clk_gating.ungate_work);
-	destroy_workqueue(hba->clk_gating.ungating_workq);
+	destroy_workqueue(hba->clk_gating.clk_gating_workq);
 }
 
 static void ufshcd_set_auto_hibern8_timer(struct ufs_hba *hba, u32 delay)
@@ -6584,6 +6604,7 @@ static int ufshcd_abort(struct scsi_cmnd *cmd)
 	 */
 	scsi_print_command(cmd);
 	if (!hba->req_abort_count) {
+		ufshcd_print_fsm_state(hba);
 		ufshcd_print_host_regs(hba);
 		ufshcd_print_host_state(hba);
 		ufshcd_print_pwr_info(hba);

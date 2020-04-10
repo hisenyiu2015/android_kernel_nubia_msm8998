@@ -1,7 +1,7 @@
 /*
  * MDSS MDP Interface (used by framebuffer core)
  *
- * Copyright (c) 2007-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2007-2018, The Linux Foundation. All rights reserved.
  * Copyright (C) 2007 Google Incorporated
  *
  * This software is licensed under the terms of the GNU General Public
@@ -2436,6 +2436,8 @@ static u32 mdss_mdp_scaler_init(struct mdss_data_type *mdata,
 		ret = mdss_mdp_ds_addr_setup(mdata);
 	}
 
+	mutex_init(&mdata->scaler_off->scaler_lock);
+
 	return ret;
 }
 
@@ -4527,6 +4529,15 @@ static int mdss_mdp_parse_dt_misc(struct platform_device *pdev)
 	mdata->clk_factor.denom = 1;
 	mdss_mdp_parse_dt_fudge_factors(pdev, "qcom,mdss-clk-factor",
 		&mdata->clk_factor);
+
+	/*
+	 * Bus throughput factor will be used during high downscale cases.
+	 * The recommended default factor is 1.1.
+	 */
+	mdata->bus_throughput_factor.numer = 11;
+	mdata->bus_throughput_factor.denom = 10;
+	mdss_mdp_parse_dt_fudge_factors(pdev, "qcom,mdss-bus-througput-factor",
+		&mdata->bus_throughput_factor);
 
 	rc = of_property_read_u32(pdev->dev.of_node,
 			"qcom,max-bandwidth-low-kbps", &mdata->max_bw_low);

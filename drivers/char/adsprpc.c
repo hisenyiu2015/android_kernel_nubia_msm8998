@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2018, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -57,12 +57,16 @@
 #define FASTRPC_ENOSUCH 39
 #define VMID_SSC_Q6     5
 #define VMID_ADSP_Q6    6
+#define AC_VM_ADSP_HEAP_SHARED 33
 #define DEBUGFS_SIZE 1024
 
 #define RPC_TIMEOUT	(5 * HZ)
 #define BALIGN		128
 #define NUM_CHANNELS	4		/* adsp,sdsp,mdsp,cdsp */
 #define NUM_SESSIONS	9		/*8 compute, 1 cpz*/
+#define FASTRPC_CTX_MAGIC (0xbeeddeed)
+#define FASTRPC_CTX_MAX (256)
+#define FASTRPC_CTXID_MASK (0xFF0)
 
 #define IS_CACHE_ALIGNED(x) (((x) & ((L1_CACHE_BYTES)-1)) == 0)
 
@@ -108,11 +112,11 @@ static inline uint64_t buf_page_offset(uint64_t buf)
 	return offset;
 }
 
-static inline int buf_num_pages(uint64_t buf, ssize_t len)
+static inline uint64_t buf_num_pages(uint64_t buf, size_t len)
 {
 	uint64_t start = buf_page_start(buf) >> PAGE_SHIFT;
 	uint64_t end = (((uint64_t) buf + len - 1) & PAGE_MASK) >> PAGE_SHIFT;
-	int nPages = end - start + 1;
+	uint64_t nPages = end - start + 1;
 	return nPages;
 }
 
@@ -141,7 +145,7 @@ struct fastrpc_buf {
 	struct fastrpc_file *fl;
 	void *virt;
 	uint64_t phys;
-	ssize_t size;
+	size_t size;
 };
 
 struct fastrpc_ctx_lst;
@@ -167,12 +171,14 @@ struct smq_invoke_ctx {
 	unsigned *attrs;
 	struct fastrpc_mmap **maps;
 	struct fastrpc_buf *buf;
-	ssize_t used;
+	size_t used;
 	struct fastrpc_file *fl;
 	uint32_t sc;
 	struct overlap *overs;
 	struct overlap **overps;
 	struct smq_msg msg;
+	unsigned int magic;
+	uint64_t ctxid;
 };
 
 struct fastrpc_ctx_lst {
@@ -211,6 +217,7 @@ struct fastrpc_channel_ctx {
 	struct device *dev;
 	struct fastrpc_session_ctx session[NUM_SESSIONS];
 	struct completion work;
+	struct completion workport;
 	struct notifier_block nb;
 	struct kref kref;
 	int sesscount;
@@ -219,6 +226,7 @@ struct fastrpc_channel_ctx {
 	int prevssrcount;
 	int issubsystemup;
 	int vmid;
+	int heap_vmid;
 	int ramdumpenabled;
 	void *remoteheap_ramdump_dev;
 	struct fastrpc_glink_info link;
@@ -238,6 +246,8 @@ struct fastrpc_apps {
 	spinlock_t hlock;
 	struct ion_client *client;
 	struct device *dev;
+	spinlock_t ctxlock;
+	struct smq_invoke_ctx *ctxtable[FASTRPC_CTX_MAX];
 };
 
 struct fastrpc_mmap {
@@ -251,9 +261,9 @@ struct fastrpc_mmap {
 	struct dma_buf_attachment *attach;
 	struct ion_handle *handle;
 	uint64_t phys;
-	ssize_t size;
+	size_t size;
 	uintptr_t va;
-	ssize_t len;
+	size_t len;
 	int refs;
 	uintptr_t raddr;
 	int uncached;
@@ -287,9 +297,11 @@ struct fastrpc_file {
 	int cid;
 	int ssrcount;
 	int pd;
+	int file_close;
 	struct fastrpc_apps *apps;
 	struct fastrpc_perf perf;
 	struct dentry *debugfs_file;
+	struct mutex map_mutex;
 };
 
 static struct fastrpc_apps gfa;
@@ -335,7 +347,7 @@ static inline int64_t getnstimediff(struct timespec *start)
 
 static void fastrpc_buf_free(struct fastrpc_buf *buf, int cache)
 {
-	struct fastrpc_file *fl = buf == 0 ? 0 : buf->fl;
+	struct fastrpc_file *fl = buf == NULL ? NULL : buf->fl;
 	int vmid;
 
 	if (!fl)
@@ -370,7 +382,8 @@ static void fastrpc_buf_list_free(struct fastrpc_file *fl)
 	struct fastrpc_buf *buf, *free;
 	do {
 		struct hlist_node *n;
-		free = 0;
+
+		free = NULL;
 		spin_lock(&fl->hlock);
 		hlist_for_each_entry_safe(buf, n, &fl->bufs, hn) {
 			hlist_del_init(&buf->hn);
@@ -402,11 +415,14 @@ static void fastrpc_mmap_add(struct fastrpc_mmap *map)
 }
 
 static int fastrpc_mmap_find(struct fastrpc_file *fl, int fd, uintptr_t va,
-			ssize_t len, int mflags, struct fastrpc_mmap **ppmap)
+			size_t len, int mflags, struct fastrpc_mmap **ppmap)
 {
 	struct fastrpc_apps *me = &gfa;
-	struct fastrpc_mmap *match = 0, *map;
+	struct fastrpc_mmap *match = NULL, *map = NULL;
 	struct hlist_node *n;
+
+	if ((va + len) < va)
+		return -EOVERFLOW;
 	if (mflags == ADSP_MMAP_HEAP_ADDR ||
 				 mflags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 		spin_lock(&me->hlock);
@@ -440,10 +456,10 @@ static int fastrpc_mmap_find(struct fastrpc_file *fl, int fd, uintptr_t va,
 	return -ENOTTY;
 }
 
-static int dma_alloc_memory(phys_addr_t *region_start, ssize_t size)
+static int dma_alloc_memory(phys_addr_t *region_start, size_t size)
 {
 	struct fastrpc_apps *me = &gfa;
-	void *vaddr = 0;
+	void *vaddr = NULL;
 	DEFINE_DMA_ATTRS(attrs);
 
 	if (me->dev == NULL) {
@@ -463,9 +479,9 @@ static int dma_alloc_memory(phys_addr_t *region_start, ssize_t size)
 }
 
 static int fastrpc_mmap_remove(struct fastrpc_file *fl, uintptr_t va,
-			       ssize_t len, struct fastrpc_mmap **ppmap)
+			       size_t len, struct fastrpc_mmap **ppmap)
 {
-	struct fastrpc_mmap *match = 0, *map;
+	struct fastrpc_mmap *match = NULL, *map;
 	struct hlist_node *n;
 	struct fastrpc_apps *me = &gfa;
 
@@ -583,14 +599,14 @@ static int fastrpc_session_alloc(struct fastrpc_channel_ctx *chan, int secure,
 					struct fastrpc_session_ctx **session);
 
 static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, unsigned attr,
-	uintptr_t va, ssize_t len, int mflags, struct fastrpc_mmap **ppmap)
+	uintptr_t va, size_t len, int mflags, struct fastrpc_mmap **ppmap)
 {
 	struct fastrpc_apps *me = &gfa;
 	struct fastrpc_session_ctx *sess;
 	struct fastrpc_apps *apps = fl->apps;
 	int cid = fl->cid;
 	struct fastrpc_channel_ctx *chan = &apps->channel[cid];
-	struct fastrpc_mmap *map = 0;
+	struct fastrpc_mmap *map = NULL;
 	struct dma_attrs attrs;
 	phys_addr_t region_start = 0;
 	unsigned long flags;
@@ -611,13 +627,13 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, unsigned attr,
 	if (mflags == ADSP_MMAP_HEAP_ADDR ||
 				mflags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 		map->apps = me;
-		map->fl = 0;
+		map->fl = NULL;
 		VERIFY(err, !dma_alloc_memory(&region_start, len));
 		if (err)
 			goto bail;
 		map->phys = (uintptr_t)region_start;
 		map->size = len;
-		map->va = map->phys;
+		map->va = (uintptr_t)map->phys;
 	} else {
 		VERIFY(err, !IS_ERR_OR_NULL(map->handle =
 				ion_import_dma_buf(fl->apps->client, fd)));
@@ -693,7 +709,7 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd, unsigned attr,
 		if (vmid) {
 			int srcVM[1] = {VMID_HLOS};
 			int destVM[2] = {VMID_HLOS, vmid};
-			int destVMperm[2] = {PERM_READ | PERM_WRITE,
+			int destVMperm[2] = {PERM_READ | PERM_WRITE | PERM_EXEC,
 					PERM_READ | PERM_WRITE | PERM_EXEC};
 
 			VERIFY(err, !hyp_assign_phys(map->phys,
@@ -715,11 +731,11 @@ bail:
 	return err;
 }
 
-static int fastrpc_buf_alloc(struct fastrpc_file *fl, ssize_t size,
+static int fastrpc_buf_alloc(struct fastrpc_file *fl, size_t size,
 			     struct fastrpc_buf **obuf)
 {
 	int err = 0, vmid;
-	struct fastrpc_buf *buf = 0, *fr = 0;
+	struct fastrpc_buf *buf = NULL, *fr = NULL;
 	struct hlist_node *n;
 
 	VERIFY(err, size > 0);
@@ -739,13 +755,13 @@ static int fastrpc_buf_alloc(struct fastrpc_file *fl, ssize_t size,
 		*obuf = fr;
 		return 0;
 	}
-	buf = 0;
-	VERIFY(err, buf = kzalloc(sizeof(*buf), GFP_KERNEL));
+	buf = NULL;
+	VERIFY(err, NULL != (buf = kzalloc(sizeof(*buf), GFP_KERNEL)));
 	if (err)
 		goto bail;
 	INIT_HLIST_NODE(&buf->hn);
 	buf->fl = fl;
-	buf->virt = 0;
+	buf->virt = NULL;
 	buf->phys = 0;
 	buf->size = size;
 	buf->virt = dma_alloc_coherent(fl->sctx->smmu.dev, buf->size,
@@ -765,7 +781,7 @@ static int fastrpc_buf_alloc(struct fastrpc_file *fl, ssize_t size,
 	if (vmid) {
 		int srcVM[1] = {VMID_HLOS};
 		int destVM[2] = {VMID_HLOS, vmid};
-		int destVMperm[2] = {PERM_READ | PERM_WRITE,
+		int destVMperm[2] = {PERM_READ | PERM_WRITE | PERM_EXEC,
 					PERM_READ | PERM_WRITE | PERM_EXEC};
 
 		VERIFY(err, !hyp_assign_phys(buf->phys, buf_page_size(size),
@@ -787,7 +803,7 @@ static int context_restore_interrupted(struct fastrpc_file *fl,
 				       struct smq_invoke_ctx **po)
 {
 	int err = 0;
-	struct smq_invoke_ctx *ctx = 0, *ictx = 0;
+	struct smq_invoke_ctx *ctx = NULL, *ictx = NULL;
 	struct hlist_node *n;
 	struct fastrpc_ioctl_invoke *invoke = &inv->inv;
 	spin_lock(&fl->hlock);
@@ -840,7 +856,7 @@ static int context_build_overlap(struct smq_invoke_ctx *ctx)
 		ctx->overs[i].raix = i;
 		ctx->overps[i] = &ctx->overs[i];
 	}
-	sort(ctx->overps, nbufs, sizeof(*ctx->overps), overlap_ptr_cmp, 0);
+	sort(ctx->overps, nbufs, sizeof(*ctx->overps), overlap_ptr_cmp, NULL);
 	max.start = 0;
 	max.end = 0;
 	for (i = 0; i < nbufs; ++i) {
@@ -869,7 +885,8 @@ bail:
 #define K_COPY_FROM_USER(err, kernel, dst, src, size) \
 	do {\
 		if (!(kernel))\
-			VERIFY(err, 0 == copy_from_user((dst), (src),\
+			VERIFY(err, 0 == copy_from_user((dst),\
+			(void const __user *)(src),\
 							(size)));\
 		else\
 			memmove((dst), (src), (size));\
@@ -878,8 +895,8 @@ bail:
 #define K_COPY_TO_USER(err, kernel, dst, src, size) \
 	do {\
 		if (!(kernel))\
-			VERIFY(err, 0 == copy_to_user((dst), (src),\
-						      (size)));\
+			VERIFY(err, 0 == copy_to_user((void __user *)(dst), \
+						(src), (size)));\
 		else\
 			memmove((dst), (src), (size));\
 	} while (0)
@@ -891,8 +908,9 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 			 struct fastrpc_ioctl_invoke_attrs *invokefd,
 			 struct smq_invoke_ctx **po)
 {
-	int err = 0, bufs, size = 0;
-	struct smq_invoke_ctx *ctx = 0;
+	int err = 0, bufs, ii, size = 0;
+	struct fastrpc_apps *me = &gfa;
+	struct smq_invoke_ctx *ctx = NULL;
 	struct fastrpc_ctx_lst *clst = &fl->clst;
 	struct fastrpc_ioctl_invoke *invoke = &invokefd->inv;
 
@@ -903,7 +921,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 		sizeof(*ctx->overs) * (bufs) +
 		sizeof(*ctx->overps) * (bufs);
 
-	VERIFY(err, ctx = kzalloc(sizeof(*ctx) + size, GFP_KERNEL));
+	VERIFY(err, NULL != (ctx = kzalloc(sizeof(*ctx) + size, GFP_KERNEL)));
 	if (err)
 		goto bail;
 
@@ -917,7 +935,7 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 	ctx->overs = (struct overlap *)(&ctx->attrs[bufs]);
 	ctx->overps = (struct overlap **)(&ctx->overs[bufs]);
 
-	K_COPY_FROM_USER(err, kernel, ctx->lpra, invoke->pra,
+	K_COPY_FROM_USER(err, kernel, (void *)ctx->lpra, invoke->pra,
 					bufs * sizeof(*ctx->lpra));
 	if (err)
 		goto bail;
@@ -945,10 +963,26 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 	ctx->pid = current->pid;
 	ctx->tgid = current->tgid;
 	init_completion(&ctx->work);
+	ctx->magic = FASTRPC_CTX_MAGIC;
 
 	spin_lock(&fl->hlock);
 	hlist_add_head(&ctx->hn, &clst->pending);
 	spin_unlock(&fl->hlock);
+
+	spin_lock(&me->ctxlock);
+	for (ii = 0; ii < FASTRPC_CTX_MAX; ii++) {
+		if (!me->ctxtable[ii]) {
+			me->ctxtable[ii] = ctx;
+			ctx->ctxid = (ptr_to_uint64(ctx) & ~0xFFF)|(ii << 4);
+			break;
+		}
+	}
+	spin_unlock(&me->ctxlock);
+	VERIFY(err, ii < FASTRPC_CTX_MAX);
+	if (err) {
+		pr_err("adsprpc: out of context memory\n");
+		goto bail;
+	}
 
 	*po = ctx;
 bail:
@@ -971,6 +1005,7 @@ static void context_save_interrupted(struct smq_invoke_ctx *ctx)
 static void context_free(struct smq_invoke_ctx *ctx)
 {
 	int i;
+	struct fastrpc_apps *me = &gfa;
 	int nbufs = REMOTE_SCALARS_INBUFS(ctx->sc) +
 		    REMOTE_SCALARS_OUTBUFS(ctx->sc);
 	spin_lock(&ctx->fl->hlock);
@@ -979,6 +1014,18 @@ static void context_free(struct smq_invoke_ctx *ctx)
 	for (i = 0; i < nbufs; ++i)
 		fastrpc_mmap_free(ctx->maps[i]);
 	fastrpc_buf_free(ctx->buf, 1);
+	ctx->magic = 0;
+	ctx->ctxid = 0;
+
+	spin_lock(&me->ctxlock);
+	for (i = 0; i < FASTRPC_CTX_MAX; i++) {
+		if (me->ctxtable[i] == ctx) {
+			me->ctxtable[i] = NULL;
+			break;
+		}
+	}
+	spin_unlock(&me->ctxlock);
+
 	kfree(ctx);
 }
 
@@ -1025,10 +1072,10 @@ static void context_list_ctor(struct fastrpc_ctx_lst *me)
 static void fastrpc_context_list_dtor(struct fastrpc_file *fl)
 {
 	struct fastrpc_ctx_lst *clst = &fl->clst;
-	struct smq_invoke_ctx *ictx = 0, *ctxfree;
+	struct smq_invoke_ctx *ictx = NULL, *ctxfree;
 	struct hlist_node *n;
 	do {
-		ctxfree = 0;
+		ctxfree = NULL;
 		spin_lock(&fl->hlock);
 		hlist_for_each_entry_safe(ictx, n, &clst->interrupted, hn) {
 			hlist_del_init(&ictx->hn);
@@ -1040,7 +1087,7 @@ static void fastrpc_context_list_dtor(struct fastrpc_file *fl)
 			context_free(ctxfree);
 	} while (ctxfree);
 	do {
-		ctxfree = 0;
+		ctxfree = NULL;
 		spin_lock(&fl->hlock);
 		hlist_for_each_entry_safe(ictx, n, &clst->pending, hn) {
 			hlist_del_init(&ictx->hn);
@@ -1059,7 +1106,7 @@ static void fastrpc_file_list_dtor(struct fastrpc_apps *me)
 	struct fastrpc_file *fl, *free;
 	struct hlist_node *n;
 	do {
-		free = 0;
+		free = NULL;
 		spin_lock(&me->hlock);
 		hlist_for_each_entry_safe(fl, n, &me->drivers, hn) {
 			hlist_del_init(&fl->hn);
@@ -1083,20 +1130,20 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	int outbufs = REMOTE_SCALARS_OUTBUFS(sc);
 	int bufs = inbufs + outbufs;
 	uintptr_t args;
-	ssize_t rlen = 0, copylen = 0, metalen = 0;
+	size_t rlen = 0, copylen = 0, metalen = 0;
 	int i, inh, oix;
 	int err = 0;
 	int mflags = 0;
 
 	/* calculate size of the metadata */
-	rpra = 0;
+	rpra = NULL;
 	list = smq_invoke_buf_start(rpra, sc);
 	pages = smq_phy_page_start(sc, list);
 	ipage = pages;
 
 	for (i = 0; i < bufs; ++i) {
 		uintptr_t buf = (uintptr_t)lpra[i].buf.pv;
-		ssize_t len = lpra[i].buf.len;
+		size_t len = lpra[i].buf.len;
 
 		if (ctx->fds[i] && (ctx->fds[i] != -1))
 			fastrpc_mmap_create(ctx->fl, ctx->fds[i],
@@ -1104,12 +1151,13 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 					mflags, &ctx->maps[i]);
 		ipage += 1;
 	}
-	metalen = copylen = (ssize_t)&ipage[0];
+	metalen = copylen = (size_t)&ipage[0];
 	/* calculate len requreed for copying */
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
 		uintptr_t mstart, mend;
-		ssize_t len = lpra[i].buf.len;
+		size_t len = lpra[i].buf.len;
+
 		if (!len)
 			continue;
 		if (ctx->maps[i])
@@ -1142,7 +1190,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	ipage = pages;
 	args = (uintptr_t)ctx->buf->virt + metalen;
 	for (i = 0; i < bufs; ++i) {
-		ssize_t len = lpra[i].buf.len;
+		size_t len = lpra[i].buf.len;
 		list[i].num = 0;
 		list[i].pgidx = 0;
 		if (!len)
@@ -1156,7 +1204,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	for (i = 0; i < inbufs + outbufs; ++i) {
 		struct fastrpc_mmap *map = ctx->maps[i];
 		uint64_t buf = ptr_to_uint64(lpra[i].buf.pv);
-		ssize_t len = lpra[i].buf.len;
+		size_t len = lpra[i].buf.len;
 		rpra[i].buf.pv = 0;
 		rpra[i].buf.len = len;
 		if (!len)
@@ -1164,7 +1212,7 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 		if (map) {
 			struct vm_area_struct *vma;
 			uintptr_t offset;
-			int num = buf_num_pages(buf, len);
+			uint64_t num = buf_num_pages(buf, len);
 			int idx = list[i].pgidx;
 
 			if (map->attr & FASTRPC_ATTR_NOVA) {
@@ -1196,9 +1244,10 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 	for (oix = 0; oix < inbufs + outbufs; ++oix) {
 		int i = ctx->overps[oix]->raix;
 		struct fastrpc_mmap *map = ctx->maps[i];
-		ssize_t mlen;
+		size_t mlen;
 		uint64_t buf;
-		ssize_t len = lpra[i].buf.len;
+		size_t len = lpra[i].buf.len;
+
 		if (!len)
 			continue;
 		if (map)
@@ -1285,7 +1334,7 @@ static int put_args(uint32_t kernel, struct smq_invoke_ctx *ctx,
 				goto bail;
 		} else {
 			fastrpc_mmap_free(ctx->maps[i]);
-			ctx->maps[i] = 0;
+			ctx->maps[i] = NULL;
 		}
 	}
 	size = sizeof(*rpra) * REMOTE_SCALARS_OUTHANDLES(sc);
@@ -1385,14 +1434,14 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	struct fastrpc_channel_ctx *channel_ctx = &fl->apps->channel[fl->cid];
 	int err = 0;
 
-	VERIFY(err, 0 != channel_ctx->chan);
+	VERIFY(err, NULL != channel_ctx->chan);
 	if (err)
 		goto bail;
 	msg->pid = current->tgid;
 	msg->tid = current->pid;
 	if (kernel)
 		msg->pid = 0;
-	msg->invoke.header.ctx = ptr_to_uint64(ctx) | fl->pd;
+	msg->invoke.header.ctx = ctx->ctxid | fl->pd;
 	msg->invoke.header.handle = handle;
 	msg->invoke.header.sc = ctx->sc;
 	msg->invoke.page.addr = ctx->buf ? ctx->buf->phys : 0;
@@ -1419,10 +1468,12 @@ static void fastrpc_init(struct fastrpc_apps *me)
 	INIT_HLIST_HEAD(&me->drivers);
 	INIT_HLIST_HEAD(&me->maps);
 	spin_lock_init(&me->hlock);
+	spin_lock_init(&me->ctxlock);
 	mutex_init(&me->smd_mutex);
 	me->channel = &gcinfo[0];
 	for (i = 0; i < NUM_CHANNELS; i++) {
 		init_completion(&me->channel[i].work);
+	init_completion(&me->channel[i].workport);
 		me->channel[i].sesscount = 0;
 	}
 }
@@ -1433,14 +1484,14 @@ static int fastrpc_internal_invoke(struct fastrpc_file *fl, uint32_t mode,
 				   uint32_t kernel,
 				   struct fastrpc_ioctl_invoke_attrs *inv)
 {
-	struct smq_invoke_ctx *ctx = 0;
+	struct smq_invoke_ctx *ctx = NULL;
 	struct fastrpc_ioctl_invoke *invoke = &inv->inv;
 	int cid = fl->cid;
 	int interrupted = 0;
 	int err = 0;
-	struct timespec invoket;
+	struct timespec invoket = {0};
 
-	VERIFY(err, fl->sctx);
+	VERIFY(err, fl->sctx != NULL);
 	if (err)
 		goto bail;
 	VERIFY(err, fl->cid >= 0 && fl->cid < NUM_CHANNELS);
@@ -1535,14 +1586,14 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 	struct fastrpc_ioctl_invoke_attrs ioctl;
 	struct fastrpc_ioctl_init *init = &uproc->init;
 	struct smq_phy_page pages[1];
-	struct fastrpc_mmap *file = 0, *mem = 0;
+	struct fastrpc_mmap *file = NULL, *mem = NULL;
 	char *proc_name = NULL;
 	int srcVM[1] = {VMID_HLOS};
-	int destVM[1] = {VMID_ADSP_Q6};
+	int destVM[1] = {gcinfo[0].heap_vmid};
 	int destVMperm[1] = {PERM_READ | PERM_WRITE | PERM_EXEC};
 	int hlosVMperm[1] = {PERM_READ | PERM_WRITE | PERM_EXEC};
 
-	VERIFY(err, !fastrpc_channel_open(fl));
+	VERIFY(err, 0 == (err = fastrpc_channel_open(fl)));
 	if (err)
 		goto bail;
 	if (init->flags == FASTRPC_INIT_ATTACH) {
@@ -1553,8 +1604,8 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 		ioctl.inv.handle = 1;
 		ioctl.inv.sc = REMOTE_SCALARS_MAKE(0, 1, 0);
 		ioctl.inv.pra = ra;
-		ioctl.fds = 0;
-		ioctl.attrs = 0;
+		ioctl.fds = NULL;
+		ioctl.attrs = NULL;
 		fl->pd = 0;
 		VERIFY(err, !(err = fastrpc_internal_invoke(fl,
 			FASTRPC_MODE_PARALLEL, 1, &ioctl)));
@@ -1566,9 +1617,9 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 		int mflags = 0;
 		struct {
 			int pgid;
-			int namelen;
-			int filelen;
-			int pageslen;
+			unsigned int namelen;
+			unsigned int filelen;
+			unsigned int pageslen;
 			int attrs;
 			int siglen;
 		} inbuf;
@@ -1576,12 +1627,19 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 		inbuf.namelen = strlen(current->comm) + 1;
 		inbuf.filelen = init->filelen;
 		fl->pd = 1;
+
+		if (!access_ok(0, (void const __user *)init->file,
+				init->filelen))
+			goto bail;
 		if (init->filelen) {
 			VERIFY(err, !fastrpc_mmap_create(fl, init->filefd, 0,
 				init->file, init->filelen, mflags, &file));
 			if (err)
 				goto bail;
 		}
+		if (!access_ok(1, (void const __user *)init->mem,
+				init->memlen))
+			goto bail;
 		inbuf.pageslen = 1;
 		VERIFY(err, !fastrpc_mmap_create(fl, init->memfd, 0,
 				init->mem, init->memlen, mflags, &mem));
@@ -1622,7 +1680,7 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 			ioctl.inv.sc = REMOTE_SCALARS_MAKE(7, 6, 0);
 		ioctl.inv.pra = ra;
 		ioctl.fds = fds;
-		ioctl.attrs = 0;
+		ioctl.attrs = NULL;
 		VERIFY(err, !(err = fastrpc_internal_invoke(fl,
 			FASTRPC_MODE_PARALLEL, 1, &ioctl)));
 		if (err)
@@ -1630,12 +1688,12 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 	} else if (init->flags == FASTRPC_INIT_CREATE_STATIC) {
 		remote_arg_t ra[3];
 		uint64_t phys = 0;
-		ssize_t size = 0;
+		size_t size = 0;
 		int fds[3];
 		struct {
 			int pgid;
-			int namelen;
-			int pageslen;
+			unsigned int namelen;
+			unsigned int pageslen;
 		} inbuf;
 
 		if (!init->filelen)
@@ -1687,8 +1745,8 @@ static int fastrpc_init_process(struct fastrpc_file *fl,
 
 		ioctl.inv.sc = REMOTE_SCALARS_MAKE(8, 3, 0);
 		ioctl.inv.pra = ra;
-		ioctl.fds = 0;
-		ioctl.attrs = 0;
+		ioctl.fds = NULL;
+		ioctl.attrs = NULL;
 		VERIFY(err, !(err = fastrpc_internal_invoke(fl,
 			FASTRPC_MODE_PARALLEL, 1, &ioctl)));
 		if (err)
@@ -1721,7 +1779,7 @@ static int fastrpc_release_current_dsp_process(struct fastrpc_file *fl)
 	VERIFY(err, fl->cid >= 0 && fl->cid < NUM_CHANNELS);
 	if (err)
 		goto bail;
-	VERIFY(err, fl->apps->channel[fl->cid].chan != 0);
+	VERIFY(err, fl->apps->channel[fl->cid].chan != NULL);
 	if (err)
 		goto bail;
 	tgid = fl->tgid;
@@ -1730,8 +1788,8 @@ static int fastrpc_release_current_dsp_process(struct fastrpc_file *fl)
 	ioctl.inv.handle = 1;
 	ioctl.inv.sc = REMOTE_SCALARS_MAKE(1, 1, 0);
 	ioctl.inv.pra = ra;
-	ioctl.fds = 0;
-	ioctl.attrs = 0;
+	ioctl.fds = NULL;
+	ioctl.attrs = NULL;
 	VERIFY(err, 0 == (err = fastrpc_internal_invoke(fl,
 		FASTRPC_MODE_PARALLEL, 1, &ioctl)));
 bail:
@@ -1776,8 +1834,8 @@ static int fastrpc_mmap_on_dsp(struct fastrpc_file *fl, uint32_t flags,
 	else
 		ioctl.inv.sc = REMOTE_SCALARS_MAKE(2, 2, 1);
 	ioctl.inv.pra = ra;
-	ioctl.fds = 0;
-	ioctl.attrs = 0;
+	ioctl.fds = NULL;
+	ioctl.attrs = NULL;
 	VERIFY(err, 0 == (err = fastrpc_internal_invoke(fl,
 		FASTRPC_MODE_PARALLEL, 1, &ioctl)));
 	map->raddr = (uintptr_t)routargs.vaddrout;
@@ -1795,7 +1853,7 @@ static int fastrpc_mmap_on_dsp(struct fastrpc_file *fl, uint32_t flags,
 	} else if (flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
 
 		int srcVM[1] = {VMID_HLOS};
-		int destVM[1] = {VMID_ADSP_Q6};
+		int destVM[1] = {gcinfo[0].heap_vmid};
 		int destVMperm[1] = {PERM_READ | PERM_WRITE | PERM_EXEC};
 
 		VERIFY(err, !hyp_assign_phys(map->phys, (uint64_t)map->size,
@@ -1811,7 +1869,7 @@ static int fastrpc_munmap_on_dsp_rh(struct fastrpc_file *fl,
 				 struct fastrpc_mmap *map)
 {
 	int err = 0;
-	int srcVM[1] = {VMID_ADSP_Q6};
+	int srcVM[1] = {gcinfo[0].heap_vmid};
 	int destVM[1] = {VMID_HLOS};
 	int destVMperm[1] = {PERM_READ | PERM_WRITE | PERM_EXEC};
 
@@ -1830,8 +1888,8 @@ static int fastrpc_munmap_on_dsp_rh(struct fastrpc_file *fl,
 		ioctl.inv.handle = 1;
 		ioctl.inv.sc = REMOTE_SCALARS_MAKE(7, 0, 1);
 		ioctl.inv.pra = ra;
-		ioctl.fds = 0;
-		ioctl.attrs = 0;
+		ioctl.fds = NULL;
+		ioctl.attrs = NULL;
 		if (fl == NULL)
 			goto bail;
 
@@ -1866,7 +1924,7 @@ static int fastrpc_munmap_on_dsp(struct fastrpc_file *fl,
 	struct {
 		int pid;
 		uintptr_t vaddrout;
-		ssize_t size;
+		size_t size;
 	} inargs;
 
 	inargs.pid = current->tgid;
@@ -1881,8 +1939,8 @@ static int fastrpc_munmap_on_dsp(struct fastrpc_file *fl,
 	else
 		ioctl.inv.sc = REMOTE_SCALARS_MAKE(3, 1, 0);
 	ioctl.inv.pra = ra;
-	ioctl.fds = 0;
-	ioctl.attrs = 0;
+	ioctl.fds = NULL;
+	ioctl.attrs = NULL;
 	VERIFY(err, 0 == (err = fastrpc_internal_invoke(fl,
 		FASTRPC_MODE_PARALLEL, 1, &ioctl)));
 	if (err)
@@ -1899,13 +1957,14 @@ bail:
 
 static int fastrpc_mmap_remove_ssr(struct fastrpc_file *fl)
 {
-	struct fastrpc_mmap *match = 0, *map = NULL;
+	struct fastrpc_mmap *match = NULL, *map = NULL;
 	struct hlist_node *n = NULL;
 	int err = 0, ret = 0;
 	struct fastrpc_apps *me = &gfa;
 	struct ramdump_segment *ramdump_segments_rh = NULL;
+
 	do {
-		match = 0;
+		match = NULL;
 		spin_lock(&me->hlock);
 		hlist_for_each_entry_safe(map, n, &me->maps, hn) {
 			match = map;
@@ -1943,7 +2002,7 @@ bail:
 }
 
 static int fastrpc_mmap_remove(struct fastrpc_file *fl, uintptr_t va,
-			     ssize_t len, struct fastrpc_mmap **ppmap);
+			     size_t len, struct fastrpc_mmap **ppmap);
 
 static void fastrpc_mmap_add(struct fastrpc_mmap *map);
 
@@ -1951,8 +2010,9 @@ static int fastrpc_internal_munmap(struct fastrpc_file *fl,
 				   struct fastrpc_ioctl_munmap *ud)
 {
 	int err = 0;
-	struct fastrpc_mmap *map = 0;
+	struct fastrpc_mmap *map = NULL;
 
+	mutex_lock(&fl->map_mutex);
 	VERIFY(err, !fastrpc_mmap_remove(fl, ud->vaddrout, ud->size, &map));
 	if (err)
 		goto bail;
@@ -1963,6 +2023,7 @@ static int fastrpc_internal_munmap(struct fastrpc_file *fl,
 bail:
 	if (err && map)
 		fastrpc_mmap_add(map);
+	mutex_unlock(&fl->map_mutex);
 	return err;
 }
 
@@ -1970,12 +2031,15 @@ static int fastrpc_internal_mmap(struct fastrpc_file *fl,
 				 struct fastrpc_ioctl_mmap *ud)
 {
 
-	struct fastrpc_mmap *map = 0;
+	struct fastrpc_mmap *map = NULL;
 	int err = 0;
-	if (!fastrpc_mmap_find(fl, ud->fd, (uintptr_t)ud->vaddrin, ud->size,
-			       ud->flags, &map))
-		return 0;
 
+	mutex_lock(&fl->map_mutex);
+	if (!fastrpc_mmap_find(fl, ud->fd, (uintptr_t)ud->vaddrin, ud->size,
+			       ud->flags, &map)){
+		mutex_unlock(&fl->map_mutex);
+		return 0;
+	}
 	VERIFY(err, !fastrpc_mmap_create(fl, ud->fd, 0,
 			(uintptr_t)ud->vaddrin, ud->size, ud->flags, &map));
 	if (err)
@@ -1987,6 +2051,7 @@ static int fastrpc_internal_mmap(struct fastrpc_file *fl,
  bail:
 	if (err && map)
 		fastrpc_mmap_free(map);
+	mutex_unlock(&fl->map_mutex);
 	return err;
 }
 
@@ -1999,9 +2064,9 @@ static void fastrpc_channel_close(struct kref *kref)
 	ctx = container_of(kref, struct fastrpc_channel_ctx, kref);
 	cid = ctx - &gcinfo[0];
 	fastrpc_glink_close(ctx->chan, cid);
-	ctx->chan = 0;
+	ctx->chan = NULL;
 	glink_unregister_link_state_cb(ctx->link.link_notify_handle);
-	ctx->link.link_notify_handle = 0;
+	ctx->link.link_notify_handle = NULL;
 	mutex_unlock(&me->smd_mutex);
 	pr_info("'closed /dev/%s c %d %d'\n", gcinfo[cid].name,
 						MAJOR(me->dev_no), cid);
@@ -2040,34 +2105,54 @@ static int fastrpc_session_alloc_locked(struct fastrpc_channel_ctx *chan,
 	return err;
 }
 
-bool fastrpc_glink_notify_rx_intent_req(void *h, const void *priv, size_t size)
+static bool fastrpc_glink_notify_rx_intent_req(void *h, const void *priv,
+						size_t size)
 {
 	if (glink_queue_rx_intent(h, NULL, size))
 		return false;
 	return true;
 }
 
-void fastrpc_glink_notify_tx_done(void *handle, const void *priv,
+static void fastrpc_glink_notify_tx_done(void *handle, const void *priv,
 		const void *pkt_priv, const void *ptr)
 {
 }
 
-void fastrpc_glink_notify_rx(void *handle, const void *priv,
+static void fastrpc_glink_notify_rx(void *handle, const void *priv,
 	const void *pkt_priv, const void *ptr, size_t size)
 {
 	struct smq_invoke_rsp *rsp = (struct smq_invoke_rsp *)ptr;
-	int len = size;
+	struct fastrpc_apps *me = &gfa;
+	uint32_t index;
+	int err = 0;
 
-	while (len >= sizeof(*rsp) && rsp) {
-		rsp->ctx = rsp->ctx & ~1;
-		context_notify_user(uint64_to_ptr(rsp->ctx), rsp->retval);
-		rsp++;
-		len = len - sizeof(*rsp);
-	}
+	VERIFY(err, (rsp && size >= sizeof(*rsp)));
+	if (err)
+		goto bail;
+
+	index = (uint32_t)((rsp->ctx & FASTRPC_CTXID_MASK) >> 4);
+	VERIFY(err, index < FASTRPC_CTX_MAX);
+	if (err)
+		goto bail;
+
+	VERIFY(err, !IS_ERR_OR_NULL(me->ctxtable[index]));
+	if (err)
+		goto bail;
+
+	VERIFY(err, ((me->ctxtable[index]->ctxid == (rsp->ctx & ~1)) &&
+		me->ctxtable[index]->magic == FASTRPC_CTX_MAGIC));
+	if (err)
+		goto bail;
+
+	context_notify_user(me->ctxtable[index], rsp->retval);
+bail:
+	if (err)
+		pr_err("adsprpc: invalid response or context\n");
 	glink_rx_done(handle, ptr, true);
 }
 
-void fastrpc_glink_notify_state(void *handle, const void *priv, unsigned event)
+static void fastrpc_glink_notify_state(void *handle, const void *priv,
+				unsigned int event)
 {
 	struct fastrpc_apps *me = &gfa;
 	int cid = (int)(uintptr_t)priv;
@@ -2079,7 +2164,7 @@ void fastrpc_glink_notify_state(void *handle, const void *priv, unsigned event)
 	switch (event) {
 	case GLINK_CONNECTED:
 		link->port_state = FASTRPC_LINK_CONNECTED;
-		complete(&me->channel[cid].work);
+		complete(&me->channel[cid].workport);
 		break;
 	case GLINK_LOCAL_DISCONNECTED:
 		link->port_state = FASTRPC_LINK_DISCONNECTED;
@@ -2123,12 +2208,14 @@ static void fastrpc_session_free(struct fastrpc_channel_ctx *chan,
 static int fastrpc_file_free(struct fastrpc_file *fl)
 {
 	struct hlist_node *n;
-	struct fastrpc_mmap *map = 0;
+	struct fastrpc_mmap *map = NULL;
 	int cid;
 
 	if (!fl)
 		return 0;
 	cid = fl->cid;
+
+	(void)fastrpc_release_current_dsp_process(fl);
 
 	spin_lock(&fl->apps->hlock);
 	hlist_del_init(&fl->hn);
@@ -2138,7 +2225,10 @@ static int fastrpc_file_free(struct fastrpc_file *fl)
 		kfree(fl);
 		return 0;
 	}
-	(void)fastrpc_release_current_dsp_process(fl);
+
+	spin_lock(&fl->hlock);
+	fl->file_close = 1;
+	spin_unlock(&fl->hlock);
 	fastrpc_context_list_dtor(fl);
 	fastrpc_buf_list_free(fl);
 	hlist_for_each_entry_safe(map, n, &fl->maps, hn) {
@@ -2162,8 +2252,9 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	if (fl) {
 		if (fl->debugfs_file != NULL)
 			debugfs_remove(fl->debugfs_file);
+		mutex_destroy(&fl->map_mutex);
 		fastrpc_file_free(fl);
-		file->private_data = 0;
+		file->private_data = NULL;
 	}
 	return 0;
 }
@@ -2231,8 +2322,7 @@ static void fastrpc_glink_close(void *chan, int cid)
 		return;
 	link = &gfa.channel[cid].link;
 
-	if (link->port_state == FASTRPC_LINK_CONNECTED ||
-		link->port_state == FASTRPC_LINK_CONNECTING) {
+	if (link->port_state == FASTRPC_LINK_CONNECTED) {
 		link->port_state = FASTRPC_LINK_DISCONNECTING;
 		glink_close(chan);
 	}
@@ -2289,9 +2379,9 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 {
 	struct fastrpc_file *fl = filp->private_data;
 	struct hlist_node *n;
-	struct fastrpc_buf *buf = 0;
-	struct fastrpc_mmap *map = 0;
-	struct smq_invoke_ctx *ictx = 0;
+	struct fastrpc_buf *buf = NULL;
+	struct fastrpc_mmap *map = NULL;
+	struct smq_invoke_ctx *ictx = NULL;
 	struct fastrpc_channel_ctx *chan;
 	struct fastrpc_session_ctx *sess;
 	unsigned int len = 0;
@@ -2341,16 +2431,16 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 		spin_lock(&fl->hlock);
 		hlist_for_each_entry_safe(buf, n, &fl->bufs, hn) {
 			len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
-						"%s %p %s %p %s %llx\n", "buf:",
-						buf, "buf->virt:", buf->virt,
-						"buf->phys:", buf->phys);
+					"%s %pK %s %pK %s %llx\n", "buf:",
+					buf, "buf->virt:", buf->virt,
+					"buf->phys:", buf->phys);
 		}
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
 					"\n%s\n",
 					"LIST OF MAPS:");
 		hlist_for_each_entry_safe(map, n, &fl->maps, hn) {
 			len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
-						"%s %p %s %lx %s %llx\n",
+						"%s %pK %s %lx %s %llx\n",
 						"map:", map,
 						"map->va:", map->va,
 						"map->phys:", map->phys);
@@ -2360,7 +2450,7 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 					"LIST OF PENDING SMQCONTEXTS:");
 		hlist_for_each_entry_safe(ictx, n, &fl->clst.pending, hn) {
 			len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
-						"%s %p %s %u %s %u %s %u\n",
+						"%s %pK %s %u %s %u %s %u\n",
 						"smqcontext:", ictx,
 						"sc:", ictx->sc,
 						"tid:", ictx->pid,
@@ -2371,7 +2461,7 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 					"LIST OF INTERRUPTED SMQCONTEXTS:");
 		hlist_for_each_entry_safe(ictx, n, &fl->clst.interrupted, hn) {
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
-					"%s %p %s %u %s %u %s %u\n",
+					"%s %pK %s %u %s %u %s %u\n",
 					"smqcontext:", ictx,
 					"sc:", ictx->sc,
 					"tid:", ictx->pid,
@@ -2415,21 +2505,25 @@ static int fastrpc_channel_open(struct fastrpc_file *fl)
 		goto bail;
 	fl->ssrcount = me->channel[cid].ssrcount;
 	if ((kref_get_unless_zero(&me->channel[cid].kref) == 0) ||
-	    (me->channel[cid].chan == 0)) {
+	    (me->channel[cid].chan == NULL)) {
 		fastrpc_glink_register(cid, me);
 		VERIFY(err, 0 == fastrpc_glink_open(cid));
 		if (err)
 			goto bail;
 
-		VERIFY(err, wait_for_completion_timeout(&me->channel[cid].work,
-						RPC_TIMEOUT));
+		VERIFY(err,
+			wait_for_completion_timeout(&me->channel[cid].workport,
+							RPC_TIMEOUT));
 		if (err) {
-			me->channel[cid].chan = 0;
+			me->channel[cid].chan = NULL;
 			goto bail;
 		}
 		kref_init(&me->channel[cid].kref);
 		pr_info("'opened /dev/%s c %d %d'\n", gcinfo[cid].name,
 						MAJOR(me->dev_no), cid);
+		err = glink_queue_rx_intent(me->channel[cid].chan, NULL, 64);
+		if (err)
+			pr_info("adsprpc: initial intent failed for %d\n", cid);
 		if (cid == 0 && me->channel[cid].ssrcount !=
 				 me->channel[cid].prevssrcount) {
 			if (fastrpc_mmap_remove_ssr(fl))
@@ -2448,10 +2542,10 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 {
 	int err = 0;
 	struct dentry *debugfs_file;
-	struct fastrpc_file *fl = 0;
+	struct fastrpc_file *fl = NULL;
 	struct fastrpc_apps *me = &gfa;
 
-	VERIFY(err, fl = kzalloc(sizeof(*fl), GFP_KERNEL));
+	VERIFY(err, NULL != (fl = kzalloc(sizeof(*fl), GFP_KERNEL)));
 	if (err)
 		return err;
 	debugfs_file = debugfs_create_file(current->comm, 0644, debugfs_root,
@@ -2469,6 +2563,7 @@ static int fastrpc_device_open(struct inode *inode, struct file *filp)
 		fl->debugfs_file = debugfs_file;
 	memset(&fl->perf, 0, sizeof(fl->perf));
 	filp->private_data = fl;
+	mutex_init(&fl->map_mutex);
 	spin_lock(&me->hlock);
 	hlist_add_head(&fl->hn, &me->drivers);
 	spin_unlock(&me->hlock);
@@ -2480,7 +2575,7 @@ static int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 	int err = 0;
 	uint32_t cid;
 
-	VERIFY(err, fl != 0);
+	VERIFY(err, fl != NULL);
 	if (err)
 		goto bail;
 	if (fl->cid == -1) {
@@ -2516,8 +2611,16 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 	int size = 0, err = 0;
 	uint32_t info;
 
-	p.inv.fds = 0;
-	p.inv.attrs = 0;
+	p.inv.fds = NULL;
+	p.inv.attrs = NULL;
+	spin_lock(&fl->hlock);
+	if (fl->file_close == 1) {
+		err = EBADF;
+		pr_warn("ADSPRPC: fastrpc_device_release is happening, So not sending any new requests to DSP");
+		spin_unlock(&fl->hlock);
+		goto bail;
+	}
+	spin_unlock(&fl->hlock);
 
 	switch (ioctl_num) {
 	case FASTRPC_IOCTL_INVOKE:
@@ -2529,7 +2632,7 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 	case FASTRPC_IOCTL_INVOKE_ATTRS:
 		if (!size)
 			size = sizeof(struct fastrpc_ioctl_invoke_attrs);
-		VERIFY(err, 0 == copy_from_user(&p.inv, param, size));
+		K_COPY_FROM_USER(err, 0, &p.inv, param, size);
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == (err = fastrpc_internal_invoke(fl, fl->mode,
@@ -2538,20 +2641,20 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 			goto bail;
 		break;
 	case FASTRPC_IOCTL_MMAP:
-		VERIFY(err, 0 == copy_from_user(&p.mmap, param,
-						sizeof(p.mmap)));
+		K_COPY_FROM_USER(err, 0, &p.mmap, param,
+						sizeof(p.mmap));
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == (err = fastrpc_internal_mmap(fl, &p.mmap)));
 		if (err)
 			goto bail;
-		VERIFY(err, 0 == copy_to_user(param, &p.mmap, sizeof(p.mmap)));
+		K_COPY_TO_USER(err, 0, param, &p.mmap, sizeof(p.mmap));
 		if (err)
 			goto bail;
 		break;
 	case FASTRPC_IOCTL_MUNMAP:
-		VERIFY(err, 0 == copy_from_user(&p.munmap, param,
-						sizeof(p.munmap)));
+		K_COPY_FROM_USER(err, 0, &p.munmap, param,
+						sizeof(p.munmap));
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == (err = fastrpc_internal_munmap(fl,
@@ -2574,35 +2677,35 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 		}
 		break;
 	case FASTRPC_IOCTL_GETPERF:
-		VERIFY(err, 0 == copy_from_user(&p.perf,
-					param, sizeof(p.perf)));
+		K_COPY_FROM_USER(err, 0, &p.perf,
+					param, sizeof(p.perf));
 		if (err)
 			goto bail;
 		p.perf.numkeys = sizeof(struct fastrpc_perf)/sizeof(int64_t);
 		if (p.perf.keys) {
 			char *keys = PERF_KEYS;
 
-			VERIFY(err, 0 == copy_to_user((char *)p.perf.keys,
-						 keys, strlen(keys)+1));
+			K_COPY_TO_USER(err, 0, (void *)p.perf.keys,
+						 keys, strlen(keys)+1);
 			if (err)
 				goto bail;
 		}
 		if (p.perf.data) {
-			VERIFY(err, 0 == copy_to_user((int64_t *)p.perf.data,
-						 &fl->perf, sizeof(fl->perf)));
+			K_COPY_TO_USER(err, 0, (void *)p.perf.data,
+						 &fl->perf, sizeof(fl->perf));
 		}
-		VERIFY(err, 0 == copy_to_user(param, &p.perf, sizeof(p.perf)));
+		K_COPY_TO_USER(err, 0, param, &p.perf, sizeof(p.perf));
 		if (err)
 			goto bail;
 		break;
 	case FASTRPC_IOCTL_GETINFO:
-	    VERIFY(err, 0 == copy_from_user(&info, param, sizeof(info)));
+	    K_COPY_FROM_USER(err, 0, &info, param, sizeof(info));
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == (err = fastrpc_get_info(fl, &info)));
 		if (err)
 			goto bail;
-		VERIFY(err, 0 == copy_to_user(param, &info, sizeof(info)));
+		K_COPY_TO_USER(err, 0, param, &info, sizeof(info));
 		if (err)
 			goto bail;
 		break;
@@ -2614,7 +2717,11 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 	case FASTRPC_IOCTL_INIT_ATTRS:
 		if (!size)
 			size = sizeof(struct fastrpc_ioctl_init_attrs);
-		VERIFY(err, 0 == copy_from_user(&p.init, param, size));
+		K_COPY_FROM_USER(err, 0, &p.init, param, size);
+		if (err)
+			goto bail;
+		VERIFY(err, p.init.init.filelen >= 0 &&
+			p.init.init.memlen >= 0);
 		if (err)
 			goto bail;
 		VERIFY(err, 0 == fastrpc_init_process(fl, &p.init));
@@ -2648,7 +2755,7 @@ static int fastrpc_restart_notifier_cb(struct notifier_block *nb,
 		ctx->issubsystemup = 0;
 		if (ctx->chan) {
 			fastrpc_glink_close(ctx->chan, cid);
-			ctx->chan = 0;
+			ctx->chan = NULL;
 			pr_info("'restart notifier: closed /dev/%s c %d %d'\n",
 				 gcinfo[cid].name, MAJOR(me->dev_no), cid);
 		}
@@ -2708,7 +2815,8 @@ static int fastrpc_cb_probe(struct device *dev)
 	int err = 0, i;
 	int secure_vmid = VMID_CP_PIXEL;
 
-	VERIFY(err, 0 != (name = of_get_property(dev->of_node, "label", NULL)));
+	VERIFY(err, NULL != (name = of_get_property(dev->of_node,
+					 "label", NULL)));
 	if (err)
 		goto bail;
 	for (i = 0; i < NUM_CHANNELS; i++) {
@@ -2758,6 +2866,7 @@ static int fastrpc_cb_probe(struct device *dev)
 	chan->sesscount++;
 	debugfs_global_file = debugfs_create_file("global", 0644, debugfs_root,
 							NULL, &debugfs_fops);
+
 bail:
 	return err;
 }
@@ -2769,8 +2878,8 @@ static int fastrpc_cb_legacy_probe(struct device *dev)
 	struct fastrpc_channel_ctx *chan;
 	struct fastrpc_session_ctx *first_sess, *sess;
 	const char *name;
-	unsigned int *range = 0, range_size = 0;
-	unsigned int *sids = 0, sids_size = 0;
+	unsigned int *range = NULL, range_size = 0;
+	unsigned int *sids = NULL, sids_size = 0;
 	int err = 0, ret = 0, i;
 
 	VERIFY(err, 0 != (domains_child_node = of_get_child_by_name(
@@ -2872,6 +2981,13 @@ static int fastrpc_probe(struct platform_device *pdev)
 		return 0;
 	}
 
+	if (of_property_read_bool(dev->of_node,
+					"qcom,fastrpc-vmid-heap-shared"))
+		gcinfo[0].heap_vmid = AC_VM_ADSP_HEAP_SHARED;
+	else
+		gcinfo[0].heap_vmid = VMID_ADSP_Q6;
+	pr_info("ADSPRPC: gcinfo[0].heap_vmid %d\n", gcinfo[0].heap_vmid);
+
 	VERIFY(err, !of_platform_populate(pdev->dev.of_node,
 					  fastrpc_match_table,
 					  NULL, &pdev->dev));
@@ -2891,17 +3007,17 @@ static void fastrpc_deinit(void)
 		if (chan->chan) {
 			kref_put_mutex(&chan->kref,
 				fastrpc_channel_close, &me->smd_mutex);
-			chan->chan = 0;
+			chan->chan = NULL;
 		}
 		for (j = 0; j < NUM_SESSIONS; j++) {
 			struct fastrpc_session_ctx *sess = &chan->session[j];
 			if (sess->smmu.dev) {
 				arm_iommu_detach_device(sess->smmu.dev);
-				sess->smmu.dev = 0;
+				sess->smmu.dev = NULL;
 			}
 			if (sess->smmu.mapping) {
 				arm_iommu_release_mapping(sess->smmu.mapping);
-				sess->smmu.mapping = 0;
+				sess->smmu.mapping = NULL;
 			}
 		}
 	}
@@ -2919,7 +3035,7 @@ static struct platform_driver fastrpc_driver = {
 static int __init fastrpc_device_init(void)
 {
 	struct fastrpc_apps *me = &gfa;
-	struct device *dev = 0;
+	struct device *dev = NULL;
 	int err = 0, i;
 
 	memset(me, 0, sizeof(*me));
@@ -2956,7 +3072,7 @@ static int __init fastrpc_device_init(void)
 		me->channel[i].prevssrcount = 0;
 		me->channel[i].issubsystemup = 1;
 		me->channel[i].ramdumpenabled = 0;
-		me->channel[i].remoteheap_ramdump_dev = 0;
+		me->channel[i].remoteheap_ramdump_dev = NULL;
 		me->channel[i].nb.notifier_call = fastrpc_restart_notifier_cb;
 		me->channel[i].handle = subsys_notif_register_notifier(
 							gcinfo[i].subsys,
